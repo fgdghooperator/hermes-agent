@@ -668,6 +668,79 @@ async def test_reconnect_reschedule_is_platform_scoped():
 
 
 @pytest.mark.asyncio
+async def test_stale_resume_pending_marker_does_not_inject_synthetic_turn():
+    """The synthetic startup resume rechecks its pinned session generation
+    immediately before adapter injection, so a superseded marker cannot become
+    current work."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="superseded-resume")
+    session_key = "agent:main:telegram:dm:superseded-resume"
+    pending_entry = SessionEntry(
+        session_key=session_key,
+        session_id="newer-sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.TEXT,
+        source=source,
+        internal=True,
+        metadata={"gateway_session_id": "old-sid"},
+    )
+
+    await runner._run_startup_resume_event(adapter, event, session_key)
+
+    adapter.handle_message.assert_not_called()
+
+
+def test_real_inbound_during_startup_restore_clears_synthetic_resume_marker():
+    """A real inbound assignment queued during startup restore suppresses the
+    stale synthetic resume for that route before it can outrank the user turn."""
+    runner, _adapter = make_restart_runner()
+    runner._startup_restore_in_progress = True
+    source = make_restart_source(chat_id="real-inbound-wins")
+    session_key = "agent:main:telegram:dm:real-inbound-wins"
+    pending_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {session_key: pending_entry}
+    runner.session_store._generate_session_key = lambda source: session_key
+
+    def _clear_resume_pending(session_key: str) -> bool:
+        pending_entry.resume_pending = False
+        return True
+
+    runner.session_store.clear_resume_pending = _clear_resume_pending
+    _resume_state = runner._session_state(session_key)
+    _resume_state.turn.agent = _AGENT_PENDING_SENTINEL
+    event = MessageEvent(text="new real assignment", message_type=MessageType.TEXT, source=source)
+
+    runner._queue_startup_restore_event(event)
+
+    assert runner._startup_restore_queue == [event]
+    assert pending_entry.resume_pending is False
+    assert session_key not in runner._running_agents
+
+
+@pytest.mark.asyncio
 async def test_startup_restore_waits_for_resume_before_draining_inbound():
     """Queued inbound turns replay only after startup resume tasks finish."""
     runner, adapter = make_restart_runner()

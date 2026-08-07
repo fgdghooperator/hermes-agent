@@ -10093,6 +10093,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         returns.
         """
         try:
+            if not self._startup_resume_marker_still_current(session_key, event):
+                logger.info(
+                    "Skipping stale startup auto-resume for %s: resume marker no longer current",
+                    session_key,
+                )
+                return
             await adapter.handle_message(event)
             session_tasks = getattr(adapter, "_session_tasks", {})
             task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
@@ -10113,6 +10119,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             queue = []
             self._startup_restore_queue = queue
         queue.append(event)
+        # A real inbound message for the same route is stronger freshness
+        # evidence than a synthetic boot auto-resume.  Clear the marker and
+        # release the pre-claim so the queued human turn wins if the resume task
+        # has not yet entered the adapter pipeline.
+        try:
+            session_key = self._session_key_for_source(event.source)
+            entry = self._current_session_entry(session_key)
+            if entry is not None and getattr(entry, "resume_pending", False):
+                self.session_store.clear_resume_pending(session_key)
+                _pre_state = self._peek_session_state(session_key)
+                if (_pre_state.turn.agent if _pre_state else None) is _AGENT_PENDING_SENTINEL:
+                    self._release_running_agent_state(session_key)
+        except Exception:
+            logger.debug("Failed to suppress stale startup resume", exc_info=True)
         try:
             source = event.source
             logger.info(
@@ -10242,6 +10262,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from gateway.delivery_ledger import (
                 RECOVERED_MARKER,
                 ledger_enabled,
+                mark_abandoned,
                 mark_delivered,
                 mark_failed,
                 sweep_recoverable,
@@ -10278,6 +10299,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if adapter is None:
                 # Platform not connected this boot — leave the row claimed;
                 # attempts cap + stale cutoff bound the retries on later boots.
+                continue
+            if not await self._recovered_obligation_still_current(row):
+                try:
+                    await asyncio.to_thread(
+                        mark_abandoned,
+                        row["obligation_id"],
+                        "stale or superseded recovered delivery obligation",
+                    )
+                except Exception:
+                    logger.debug("delivery ledger stale quarantine failed", exc_info=True)
                 continue
             content = row["content"]
             if row.get("needs_marker"):
@@ -10328,6 +10359,74 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=True,
                     )
         return redelivered
+
+    def _current_session_entry(self, session_key: str):
+        store = getattr(self, "session_store", None)
+        if store is None or not session_key:
+            return None
+        try:
+            with store._lock:  # noqa: SLF001 - same snapshot pattern as startup resume
+                store._ensure_loaded_locked()  # noqa: SLF001
+                return store._entries.get(session_key)  # noqa: SLF001
+        except Exception:
+            try:
+                return getattr(store, "_entries", {}).get(session_key)
+            except Exception:
+                return None
+
+    def _startup_resume_marker_still_current(self, session_key: str, event: MessageEvent) -> bool:
+        entry = self._current_session_entry(session_key)
+        if entry is None or not getattr(entry, "resume_pending", False):
+            return False
+        expected_session_id = str(
+            (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
+        ).strip()
+        if expected_session_id and str(getattr(entry, "session_id", "")) != expected_session_id:
+            return False
+        return True
+
+    async def _recovered_obligation_still_current(self, row: dict) -> bool:
+        """Fence recovered final text to the session generation that produced it."""
+        session_key = str(row.get("session_key") or "")
+        entry = self._current_session_entry(session_key)
+        if entry is None:
+            return False
+        origin_profile = str(row.get("origin_profile") or "").strip()
+        if origin_profile:
+            current_profile = str(
+                getattr(getattr(entry, "origin", None), "profile", None) or ""
+            ).strip()
+            if current_profile != origin_profile:
+                return False
+        origin_session_id = str(row.get("origin_session_id") or "").strip()
+        if origin_session_id:
+            current_session_id = str(getattr(entry, "session_id", "") or "")
+            if current_session_id == origin_session_id:
+                return True
+            session_db = getattr(self, "_session_db", None)
+            if session_db is not None:
+                try:
+                    tip_session_id = await session_db.get_compression_tip(origin_session_id)
+                    return bool(tip_session_id and str(tip_session_id) == current_session_id)
+                except Exception:
+                    logger.debug(
+                        "delivery obligation compression-tip lookup failed for %s",
+                        origin_session_id,
+                        exc_info=True,
+                    )
+            return False
+
+        # Legacy rows lack a durable session id.  Preserve at-least-once only
+        # when the current route entry is not newer than the obligation row;
+        # once a newer assignment/session entry exists, fail closed.
+        try:
+            created_at = float(row.get("created_at") or 0)
+            entry_created_at = getattr(entry, "created_at", None)
+            if entry_created_at is not None and hasattr(entry_created_at, "timestamp"):
+                return entry_created_at.timestamp() <= created_at
+        except Exception:
+            pass
+        return False
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
@@ -10449,6 +10548,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
+                metadata={"gateway_session_id": entry.session_id},
             )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
@@ -16188,6 +16288,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if resolved_entry is None:
                 return
             session_entry = resolved_entry
+        try:
+            metadata = getattr(event, "metadata", None)
+            if metadata is None:
+                metadata = {}
+                event.metadata = metadata
+            if isinstance(metadata, dict):
+                metadata["gateway_session_id"] = session_entry.session_id
+        except Exception:
+            logger.debug("Failed to stamp gateway session id on event", exc_info=True)
         self._cache_session_source(session_key, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:

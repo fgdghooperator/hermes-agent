@@ -11,6 +11,8 @@ id stability, and the startup redelivery sweep's contract:
 
 import time
 import threading
+from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -36,6 +38,8 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
         chat_id=kw.get("chat_id", "C1"),
         thread_id=kw.get("thread_id", "171.001"),
         content=kw.get("content", "the final answer"),
+        origin_session_id=kw.get("origin_session_id", "sid"),
+        origin_profile=kw.get("origin_profile", ""),
     )
 
 
@@ -146,16 +150,35 @@ class TestGatewayRedeliverySweep:
     """Drive the real GatewayRunner._redeliver_pending_obligations."""
 
     @staticmethod
-    def _runner(adapter=None):
+    def _runner(
+        adapter=None,
+        *,
+        session_id="sid",
+        session_key="agent:main:slack:channel:C1",
+        created_at=None,
+        profile="",
+    ):
         from gateway.config import Platform
         from gateway.run import GatewayRunner
 
         runner = object.__new__(GatewayRunner)
         runner.adapters = {Platform.SLACK: adapter} if adapter else {}
+        store = MagicMock()
+        store._lock = threading.Lock()
+        store._ensure_loaded_locked = MagicMock()
+        store._entries = {
+            session_key: SimpleNamespace(
+                session_id=session_id,
+                created_at=created_at or datetime.fromtimestamp(time.time() - 10),
+                resume_pending=False,
+                origin=SimpleNamespace(profile=profile or None),
+            )
+        }
+        runner.session_store = store
+        runner._session_db = None
         _store = MagicMock()
         _store.clear_resume_pending = AsyncMock()
-        _store._store = None
-        runner.session_store = None
+        _store._store = runner.session_store
         runner._async_session_store = _store
         return runner
 
@@ -184,6 +207,131 @@ class TestGatewayRedeliverySweep:
         runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
             "agent:main:slack:channel:C1"
         )
+
+    @pytest.mark.asyncio
+    async def test_superseded_obligation_is_abandoned_without_send(self):
+        _record(origin_session_id="old-sid", content="stale final answer")
+        _orphan("ob-1")
+        adapter = self._adapter()
+        runner = self._runner(adapter, session_id="new-sid")
+
+        n = await runner._redeliver_pending_obligations()
+
+        assert n == 0
+        adapter.send.assert_not_called()
+        assert _row("ob-1")["state"] == "abandoned"
+
+    @pytest.mark.asyncio
+    async def test_historical_complete_sentinel_obligation_is_not_replayed(self):
+        _record(
+            origin_session_id="fgd-229-old",
+            content="Historical Work Hub result\n\nCOMPLETE SENTINEL",
+        )
+        _orphan("ob-1")
+        adapter = self._adapter()
+        runner = self._runner(adapter, session_id="dashboard-readiness-pr-8")
+
+        n = await runner._redeliver_pending_obligations()
+
+        assert n == 0
+        adapter.send.assert_not_called()
+        assert _row("ob-1")["state"] == "abandoned"
+
+    @pytest.mark.parametrize(
+        ("origin_session_id", "current_session_id", "content"),
+        [
+            ("FGD-229-old", "work-hub-current", "Jimmy historical FGD-229 Work Hub replay"),
+            ("REM-226-old", "remh-current", "Kenny historical REM-226 / REM-161 / REM-225 replay"),
+            (
+                "feat-tcc-change-markers-v1-old",
+                "dashboard-readiness-pr-8",
+                "Timmy Money Flow replay while current state is Dashboard Readiness PR #8",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_historical_fixture_obligations_are_not_replayed(
+        self, origin_session_id, current_session_id, content
+    ):
+        _record(origin_session_id=origin_session_id, content=content)
+        _orphan("ob-1")
+        adapter = self._adapter()
+        runner = self._runner(adapter, session_id=current_session_id)
+
+        n = await runner._redeliver_pending_obligations()
+
+        assert n == 0
+        adapter.send.assert_not_called()
+        assert _row("ob-1")["state"] == "abandoned"
+
+    @pytest.mark.asyncio
+    async def test_current_obligation_at_least_once_redelivery_remains_intact(self):
+        _record(origin_session_id="current-sid", content="current owed answer")
+        _orphan("ob-1")
+        adapter = self._adapter()
+        runner = self._runner(adapter, session_id="current-sid")
+
+        n = await runner._redeliver_pending_obligations()
+
+        assert n == 1
+        adapter.send.assert_awaited_once()
+        assert adapter.send.call_args.kwargs["content"] == "current owed answer"
+        assert _row("ob-1")["state"] == "delivered"
+
+    @pytest.mark.asyncio
+    async def test_legacy_obligation_fails_closed_when_route_has_newer_session(self):
+        _record(origin_session_id="", content="legacy stale answer")
+        _orphan("ob-1")
+        adapter = self._adapter()
+        runner = self._runner(
+            adapter,
+            session_id="newer-sid",
+            created_at=datetime.now() + timedelta(seconds=10),
+        )
+
+        n = await runner._redeliver_pending_obligations()
+
+        assert n == 0
+        adapter.send.assert_not_called()
+        assert _row("ob-1")["state"] == "abandoned"
+
+    @pytest.mark.asyncio
+    async def test_cross_profile_route_identity_cannot_adopt_foreign_response(self):
+        _record(
+            session_key="agent:jimmy:slack:channel:C1",
+            origin_session_id="jimmy-sid",
+            content="jimmy recovered answer",
+        )
+        _orphan("ob-1")
+        adapter = self._adapter()
+        runner = self._runner(
+            adapter,
+            session_key="agent:kenny:slack:channel:C1",
+            session_id="kenny-sid",
+        )
+
+        n = await runner._redeliver_pending_obligations()
+
+        assert n == 0
+        adapter.send.assert_not_called()
+        assert _row("ob-1")["state"] == "abandoned"
+
+    @pytest.mark.asyncio
+    async def test_same_route_wrong_profile_identity_is_quarantined(self):
+        _record(
+            origin_session_id="sid",
+            origin_profile="jimmy",
+            content="wrong profile answer",
+        )
+        _orphan("ob-1")
+        adapter = self._adapter()
+        runner = self._runner(adapter, session_id="sid", profile="kenny")
+
+        n = await runner._redeliver_pending_obligations()
+
+        assert n == 0
+        adapter.send.assert_not_called()
+        assert _row("ob-1")["state"] == "abandoned"
 
     @pytest.mark.asyncio
     async def test_attempting_redelivers_with_marker(self):
