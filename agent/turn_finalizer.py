@@ -562,6 +562,55 @@ def finalize_turn(
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
 
+    # Shared MC-LOCAL-209 assignment-bound terminal-state guard.
+    # This runs before profile-specific guards and strips false completion
+    # sentinels from ACTIVE/BLOCKED/WRONG_LANE states across wired profiles.
+    if final_response and not interrupted:
+        try:
+            from agent.assignment_bound_terminal_guard import apply_assignment_terminal_guard
+
+            _guarded_response, _assignment_state = apply_assignment_terminal_guard(
+                final_response=final_response,
+                messages=messages,
+                original_user_message=original_user_message,
+            )
+            if _guarded_response != final_response:
+                final_response = _guarded_response
+                _response_transformed = True
+                logger.info(
+                    "Assignment-bound terminal guard applied state=%s session=%s",
+                    _assignment_state,
+                    agent.session_id or "none",
+                )
+        except Exception as exc:
+            logger.warning("Assignment-bound terminal guard failed: %s", exc)
+
+    # Bebe MC-LOCAL-209 assignment-bound output guard.
+    # This remains scoped to the bebe profile + assignment context and uses only
+    # harness/runtime terminal state (kanban terminal tools or explicit harness
+    # state labels), never arbitrary model prose, to normalize the delivered
+    # final response for Bebe's local-model route.
+    if final_response and not interrupted:
+        try:
+            from agent.bebe_assignment_guard import apply_bebe_assignment_guard
+
+            _guarded_response, _bebe_assignment_state = apply_bebe_assignment_guard(
+                agent=agent,
+                final_response=final_response,
+                messages=messages,
+                original_user_message=original_user_message,
+            )
+            if _guarded_response != final_response:
+                final_response = _guarded_response
+                _response_transformed = True
+                logger.info(
+                    "Bebe assignment output guard applied state=%s session=%s",
+                    _bebe_assignment_state,
+                    agent.session_id or "none",
+                )
+        except Exception as exc:
+            logger.warning("Bebe assignment output guard failed: %s", exc)
+
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync

@@ -113,6 +113,8 @@ _KEY_ALIASES = {
     "windows": "win", "super": "win", "meta": "win",
 }
 
+_HEADLESS_SYSTEM_UI_TARGETS = {"screen", "desktop", "systemuiserver", "com.apple.systemuiserver"}
+
 
 def _canon_key_combo(keys: str) -> frozenset:
     # Split on both "+" and "-": the cua-driver backend's _parse_key_combo
@@ -132,6 +134,24 @@ _BLOCKED_TYPE_PATTERNS = [
     re.compile(r"\bsudo\s+rm\s+-[rf]", re.IGNORECASE),
     re.compile(r"\brm\s+-rf\s+/\s*$", re.IGNORECASE),
     re.compile(r":\s*\(\)\s*\{\s*:\|:\s*&\s*\}", re.IGNORECASE),  # fork bomb
+    # Headless Mac Mini session/power invariants (MC-LOCAL-209): never allow
+    # computer_use to type or paste commands/scripts/menu search terms that
+    # lock, sleep, log out, reboot, shut down, alter FileVault/auto-login, or
+    # enable screen/power sleep on a headless machine.
+    re.compile(r"\bpmset\b[^\n]*(?:sleepnow|\b(?:sleep|displaysleep|standby)\s+(?!0\b)\d+)", re.IGNORECASE),
+    re.compile(r"\bCGSession\b[^\n]*\s-suspend\b", re.IGNORECASE),
+    re.compile(r"\bosascript\b[^\n]*(?:\bsleep\b|\brestart\b|\bshut\s+down\b|\blog\s+out\b|\block\s+screen\b|CGSession|System Events)", re.IGNORECASE),
+    re.compile(r"\b(?:shutdown|reboot|halt|poweroff)\b", re.IGNORECASE),
+    re.compile(r"\b(?:killall|pkill)\b[^\n]*\bloginwindow\b", re.IGNORECASE),
+    re.compile(r"\blaunchctl\s+reboot\b", re.IGNORECASE),
+    re.compile(r"\bsysadminctl\b(?=[^\n]*screenlock)(?![^\n]*screenlock\s+status\b)", re.IGNORECASE),
+    re.compile(r"\bfdesetup\s+enable\b", re.IGNORECASE),
+    re.compile(r"\bdefaults\s+(?:write|delete)\b[^\n]*com\.apple\.loginwindow[^\n]*autoLoginUser\b", re.IGNORECASE),
+    re.compile(r"\b(?:Lock Screen|Sleep|Restart|Shut Down|Log Out)\b", re.IGNORECASE),
+]
+
+_BLOCKED_SET_VALUE_PATTERNS = [
+    re.compile(r"\b(?:Lock Screen|Sleep|Restart|Shut Down|Log Out|Fast User Switching)\b", re.IGNORECASE),
 ]
 
 
@@ -140,6 +160,18 @@ def _is_blocked_type(text: str) -> Optional[str]:
         if pat.search(text):
             return pat.pattern
     return None
+
+
+def _is_blocked_set_value(value: str) -> Optional[str]:
+    for pat in _BLOCKED_SET_VALUE_PATTERNS:
+        if pat.search(value):
+            return pat.pattern
+    return None
+
+
+def _is_system_ui_target(app: Any) -> bool:
+    target = str(app or "").strip().lower()
+    return target in _HEADLESS_SYSTEM_UI_TARGETS
 
 
 # ---------------------------------------------------------------------------
@@ -457,8 +489,26 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
         if pat:
             return json.dumps({
                 "error": f"blocked pattern in type text: {pat!r}",
-                "hint": "Dangerous shell patterns cannot be typed via computer_use.",
+                "code": "headless_mac_safety_denied" if "pmset" in pat or "osascript" in pat or "shutdown" in pat or "Lock Screen" in pat else "blocked_type_pattern",
+                "hint": "Dangerous shell or headless Mac session/power actions cannot be typed via computer_use.",
             })
+
+    if action == "set_value":
+        value = str(args.get("value", ""))
+        pat = _is_blocked_set_value(value)
+        if pat:
+            return json.dumps({
+                "error": f"blocked system/session menu value: {pat!r}",
+                "code": "headless_mac_safety_denied",
+                "hint": "Lock/sleep/logout/restart/shutdown GUI equivalents are hard-denied on the headless Mac Mini.",
+            })
+
+    if action in {"click", "double_click", "right_click", "middle_click", "drag"} and _is_system_ui_target(args.get("app")):
+        return json.dumps({
+            "error": "blocked system UI pointer action on headless Mac Mini",
+            "code": "headless_mac_safety_denied",
+            "hint": "Apple-menu/SystemUIServer pointer routes are unclassifiable before execution and are hard-denied. Use non-session housekeeping routes such as cmd+w or app quit instead.",
+        })
 
     if action == "key":
         keys = args.get("keys", "")
@@ -467,7 +517,8 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
             if blocked.issubset(combo) and len(blocked) <= len(combo):
                 return json.dumps({
                     "error": f"blocked key combo: {sorted(blocked)}",
-                    "hint": "Destructive system shortcuts are hard-blocked.",
+                    "code": "headless_mac_safety_denied",
+                    "hint": "Destructive system shortcuts are hard-blocked; lock/logout/sleep/restart/shutdown are never agent-authorized on the headless Mac Mini.",
                 })
 
     if args.get("bring_to_front") and args.get("delivery_mode") != "foreground":

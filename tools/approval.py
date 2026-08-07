@@ -386,7 +386,7 @@ _CMDPOS = (
     r'\s*'                          # optional whitespace
     r'(?:sudo\s+(?:-[^\s]+\s+)*)?'  # optional sudo with flags
     r'(?:env\s+(?:\w+=\S*\s+)*)?'   # optional env with VAR=VAL pairs
-    r'(?:(?:exec|nohup|setsid|time)\s+)*'  # optional wrapper commands
+    r'(?:(?:command|builtin|exec|nohup|setsid|time)\s+)*'  # optional wrapper commands
     r'\s*'
 )
 
@@ -467,6 +467,17 @@ HARDLINE_PATTERNS = [
     (_CMDPOS + r'init\s+[06]\b', "init 0/6 (shutdown/reboot)"),
     (_CMDPOS + r'systemctl\s+(poweroff|reboot|halt|kexec)\b', "systemctl poweroff/reboot"),
     (_CMDPOS + r'telinit\s+[06]\b', "telinit 0/6 (shutdown/reboot)"),
+    # Headless Mac Mini safety floor (MC-LOCAL-209): the Mac may be headless
+    # with no physical keyboard recovery path. These session/power/login-state
+    # actions are never agent-authorized, even under yolo or approvals.mode=off.
+    (_CMDPOS + r'pmset\b(?=[^\n]*(?:sleepnow|\b(?:sleep|displaysleep|standby)\s+(?!0\b)\d+))', "headless Mac power/session invariant: pmset sleep enabled or sleepnow"),
+    (_CMDPOS + r'(?:/System/Library/CoreServices/Menu\ Extras/User\.menu/Contents/Resources/)?CGSession\b[^\n]*\s-suspend\b', "headless Mac power/session invariant: Lock Screen / fast user switching"),
+    (_CMDPOS + r'osascript\b(?=[^\n]*(?:\bsleep\b|\brestart\b|\bshut\s+down\b|\blog\s+out\b|\block\s+screen\b|CGSession|System Events[^\n]*(?:keystroke\s+["\']q["\'][^\n]*(?:command|shift)|key\s+code\s+12[^\n]*(?:command|shift))))', "headless Mac power/session invariant: AppleScript session/power action"),
+    (_CMDPOS + r'(?:killall|pkill)\b[^\n]*\bloginwindow\b', "headless Mac power/session invariant: loginwindow termination"),
+    (_CMDPOS + r'launchctl\s+reboot\b', "headless Mac power/session invariant: launchctl reboot"),
+    (_CMDPOS + r'sysadminctl\b(?=[^\n]*screenlock)(?![^\n]*screenlock\s+status\b)', "headless Mac power/session invariant: screen lock setting change"),
+    (_CMDPOS + r'fdesetup\s+enable\b', "headless Mac power/session invariant: FileVault enable"),
+    (_CMDPOS + r'defaults\s+(?:write|delete)\b[^\n]*com\.apple\.loginwindow[^\n]*autoLoginUser\b', "headless Mac power/session invariant: automatic login modification"),
 ]
 
 # Pre-compiled variant used by the hot-path matcher. Building these at module
