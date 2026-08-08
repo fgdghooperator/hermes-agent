@@ -64,3 +64,45 @@ def test_normalize_complete_removes_malformed_duplicate_sentinel():
         "Done\nSENTINEL!!!\nCOMPLETE-SENTINEL",
         "COMPLETE",
     ) == "Done\n\nCOMPLETE SENTINEL"
+
+
+def test_latest_prompt_state_beats_stale_prior_complete_sentinel():
+    response, state = apply_assignment_terminal_guard(
+        final_response="BLOCKED — VALIDATION INCOMPLETE\n\nCOMPLETE SENTINEL",
+        messages=[],
+        original_user_message=(
+            "MC-LOCAL-209 assignment-bound replay review.\n"
+            "Historical prior transcript: state: COMPLETE\nCOMPLETE SENTINEL\n"
+            "Current assignment terminal state: BLOCKED"
+        ),
+    )
+    assert state == "BLOCKED"
+    assert response.startswith("BLOCKED — VALIDATION INCOMPLETE")
+    assert "COMPLETE SENTINEL" not in response
+
+
+def test_current_response_blocked_beats_stale_prompt_complete():
+    response, state = apply_assignment_terminal_guard(
+        final_response="BLOCKED — VALIDATION INCOMPLETE\n\nCOMPLETE SENTINEL",
+        messages=[],
+        original_user_message=(
+            "MC-LOCAL-209 assignment-bound status check. "
+            "Recovered historical note said terminal state: COMPLETE."
+        ),
+    )
+    assert state == "BLOCKED"
+    assert "COMPLETE SENTINEL" not in response
+
+
+def test_latest_response_state_beats_stale_complete_line():
+    response, state = apply_assignment_terminal_guard(
+        final_response=(
+            "COMPLETE — stale recovered text\nCOMPLETE SENTINEL\n\n"
+            "BLOCKED — VALIDATION INCOMPLETE\n\nCOMPLETE SENTINEL"
+        ),
+        messages=[],
+        original_user_message="MC-LOCAL-209 assignment-bound packet status check",
+    )
+    assert state == "BLOCKED"
+    assert "BLOCKED — VALIDATION INCOMPLETE" in response
+    assert "COMPLETE SENTINEL" not in response

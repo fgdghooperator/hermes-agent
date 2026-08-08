@@ -58,18 +58,34 @@ def _normalize_state(raw: str) -> TerminalState:
     return "ACTIVE"
 
 
+def _last_state_from_matches(matches: Iterable[re.Match[str]]) -> Optional[TerminalState]:
+    state: Optional[TerminalState] = None
+    for match in matches:
+        # A bare/variant COMPLETE SENTINEL line is a marker, not a terminal
+        # state label. Treating it as state is the root false-completion class.
+        if match.group(1).upper() == "COMPLETE" and "SENTINEL" in match.group(0).upper():
+            continue
+        state = _normalize_state(match.group(1))
+    return state
+
+
 def _state_from_text(text: str) -> Optional[TerminalState]:
-    match = _STATE_RE.search(text or "")
-    if match:
-        return _normalize_state(match.group(1))
-    return None
+    # Assignment prompts can include quoted historical transcripts before the
+    # current harness label. Use the latest explicit label so stale prior
+    # ``State: COMPLETE`` text cannot dominate a current BLOCKED/ACTIVE state.
+    return _last_state_from_matches(_STATE_RE.finditer(text or ""))
 
 
 def _state_from_response(text: str) -> Optional[TerminalState]:
-    match = _RESPONSE_STATE_RE.search(text or "")
-    if match:
-        return _normalize_state(match.group(1))
-    return None
+    # Same latest-label rule for generated output: if a stale recovered
+    # COMPLETE snippet appears before the current BLOCKED/ACTIVE/WRONG_LANE
+    # status, the current terminal state wins and the sentinel is stripped.
+    # Remove sentinel marker lines before state detection so ``COMPLETE
+    # SENTINEL`` cannot be mistaken for a COMPLETE state label.
+    text_without_sentinel_lines = "\n".join(
+        line for line in (text or "").splitlines() if not _SENTINEL_LINE_RE.match(line)
+    )
+    return _last_state_from_matches(_RESPONSE_STATE_RE.finditer(text_without_sentinel_lines))
 
 
 def _strip_sentinel_variants(text: str) -> str:
@@ -94,15 +110,18 @@ def determine_assignment_terminal_state(
     if _ASSIGNMENT_ID not in combined or "assignment" not in combined.lower():
         return None
 
-    # Harness prompt labels are authoritative. Response labels catch the exact
-    # regression class where the assistant says BLOCKED/ACTIVE then appends a
-    # false completion sentinel.
-    state = _state_from_text(prompt)
-    if state:
-        return state
-    state = _state_from_response(response)
-    if state:
-        return state
+    # Harness prompt labels and response labels are both authoritative surfaces.
+    # Prefer non-COMPLETE response states over a prompt COMPLETE because that is
+    # the observed stale-replay failure mode: old completion text can be present
+    # while the current assistant response correctly says BLOCKED/ACTIVE.
+    prompt_state = _state_from_text(prompt)
+    response_state = _state_from_response(response)
+    if response_state in {"ACTIVE", "BLOCKED", "WRONG_LANE"}:
+        return response_state
+    if prompt_state:
+        return prompt_state
+    if response_state:
+        return response_state
     return None
 
 
