@@ -313,6 +313,22 @@ class TestResumePendingSystemNote:
         # But still guards against re-running already-recorded tool calls.
         assert "already appear in the history" in note
 
+    def test_empty_message_interactive_note_continues_active_assignment(self):
+        """First-class gateway agents must not ask 'what next?' after restart.
+
+        Regression for MC-LOCAL-211 runtime proof: an interactive Telegram
+        resume with an unfinished approved assignment produced a generic
+        restored-session acknowledgement and asked the user what to do next.
+        Empty startup resumes must rehydrate/continue the interrupted task
+        while still warning not to rerun already-recorded tool calls.
+        """
+        note = build_resume_recovery_note("restart_timeout", "", interactive=True)
+        assert "CONTINUE the interrupted task" in note
+        assert "ask what they would like to do next" not in note
+        assert "What would you like" not in note
+        assert "skip any unfinished work" not in note
+        assert "already appear in the history" in note
+
 
     def test_resume_pending_fires_without_tool_tail(self):
         """Key improvement over PR #9934: the restart-resume note fires

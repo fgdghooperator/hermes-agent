@@ -973,21 +973,13 @@ def build_resume_recovery_note(
             "Do NOT re-execute old tool calls — skip any "
             "unfinished work from the conversation history."
         )
-    elif interactive:
-        resume_guidance = (
-            "Report to the user that the session was restored "
-            "successfully and ask what they would like to do next."
-        )
-        tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any "
-            "unfinished work from the conversation history."
-        )
     else:
         resume_guidance = (
-            "No user is present on this non-interactive platform, "
-            "so do NOT emit a 'session restored' acknowledgement "
-            "or ask questions. Review the conversation history and "
-            "CONTINUE the interrupted task to completion."
+            "Review the conversation history and CONTINUE the interrupted "
+            "task to completion. If a newer user message is present, obey "
+            "that newer message first; otherwise resume from the first "
+            "unfinished approved step. Do NOT emit a generic 'session "
+            "restored' acknowledgement and do NOT ask what to do next."
         )
         tail_guidance = (
             "Do NOT re-run tool calls whose results already "
