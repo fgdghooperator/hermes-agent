@@ -296,6 +296,63 @@ class TestGatewayRedeliverySweep:
         assert _row("ob-1")["state"] == "abandoned"
 
     @pytest.mark.asyncio
+    async def test_pre_metadata_legacy_obligation_fails_closed_on_long_lived_route(self):
+        """Regression for MC-LOCAL-211 runtime failure after PR #2.
+
+        Real stale MC-LOCAL-189/MC-LOCAL-213 rows were created before origin
+        metadata existed.  The Telegram group route was long-lived, so its
+        entry creation time predated those rows and the previous compatibility
+        fallback redelivered them as if they were current.  Legacy rows cannot
+        prove producer identity, so they must fail closed even when the route
+        entry is older than the row.
+        """
+        _record(
+            origin_session_id="",
+            content="TCC MISSION CONTROL WORK HUB COMPLETE\n\nCOMPLETE SENTINEL",
+        )
+        _orphan("ob-1")
+        adapter = self._adapter()
+        runner = self._runner(
+            adapter,
+            session_id="current-mc-local-211",
+            created_at=datetime.now() - timedelta(days=30),
+        )
+
+        n = await runner._redeliver_pending_obligations()
+
+        assert n == 0
+        adapter.send.assert_not_called()
+        row = _row("ob-1")
+        assert row is not None
+        assert row["state"] == "abandoned"
+
+    @pytest.mark.asyncio
+    async def test_multiple_pre_metadata_historical_obligations_are_quarantined(self):
+        old_items = {
+            "ob-1": "MC-LOCAL-189 Work Hub stale closeout",
+            "ob-2": "MC-LOCAL-213 LocalWP stale closeout",
+            "ob-3": "historical COMPLETE SENTINEL",
+        }
+        for oid, content in old_items.items():
+            _record(oid=oid, origin_session_id="", content=content)
+            _orphan(oid)
+        adapter = self._adapter()
+        runner = self._runner(
+            adapter,
+            session_id="current-mc-local-211",
+            created_at=datetime.now() - timedelta(days=30),
+        )
+
+        n = await runner._redeliver_pending_obligations()
+
+        assert n == 0
+        adapter.send.assert_not_called()
+        for oid in old_items:
+            row = _row(oid)
+            assert row is not None
+            assert row["state"] == "abandoned"
+
+    @pytest.mark.asyncio
     async def test_cross_profile_route_identity_cannot_adopt_foreign_response(self):
         _record(
             session_key="agent:jimmy:slack:channel:C1",

@@ -10416,16 +10416,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
             return False
 
-        # Legacy rows lack a durable session id.  Preserve at-least-once only
-        # when the current route entry is not newer than the obligation row;
-        # once a newer assignment/session entry exists, fail closed.
-        try:
-            created_at = float(row.get("created_at") or 0)
-            entry_created_at = getattr(entry, "created_at", None)
-            if entry_created_at is not None and hasattr(entry_created_at, "timestamp"):
-                return entry_created_at.timestamp() <= created_at
-        except Exception:
-            pass
+        # Legacy/pre-MC-LOCAL-211 rows lack a durable producer session id, so
+        # they cannot prove they belong to the current route generation.  The
+        # previous compatibility fallback compared row time to route creation
+        # time, but a long-lived Telegram group route can predate many unrelated
+        # historical final responses; after restart those old rows were treated
+        # as current and redelivered into the active conversation.  Fail closed:
+        # at-least-once recovery is preserved for current rows by the required
+        # origin_session_id metadata recorded at production time.
         return False
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
