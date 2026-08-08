@@ -68,6 +68,22 @@ def _async_event(delegation_id="deleg_duplicate"):
     }
 
 
+class _FakeAsyncSessionDB:
+    def __init__(self, rows, tips=None):
+        self.rows = rows
+        self.tips = tips or {}
+
+    async def get_session(self, session_id):
+        return self.rows.get(session_id)
+
+    async def get_compression_tip(self, session_id):
+        return self.tips.get(session_id)
+
+
+def _route_entry(session_id):
+    return SimpleNamespace(session_id=session_id, resume_pending=False)
+
+
 def _completion_event(*, started_at, session_id="proc_reused"):
     return {
         "type": "completion",
@@ -184,6 +200,79 @@ def test_failed_async_injection_is_retried_and_only_success_is_acked(
 
     assert adapter.handle_message.await_count == 2
     assert acknowledgements == ["deleg_duplicate"]
+
+
+def test_stale_async_completion_is_dropped_before_adapter_acceptance(monkeypatch):
+    from tools import async_delegation
+
+    event = _async_event("deleg_stale_live_parent")
+    event["parent_session_id"] = "sess_old"
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(
+        adapter,
+        origins={event["session_key"]: _route_entry("sess_current")},
+    )
+    setattr(runner, "_session_db", _FakeAsyncSessionDB({
+        "sess_old": {"id": "sess_old", "ended_at": None},
+        "sess_current": {"id": "sess_current", "ended_at": None},
+    }))
+    monkeypatch.setattr(
+        async_delegation,
+        "claim_completion_delivery",
+        lambda _delegation_id, _claim_id: True,
+        raising=False,
+    )
+    drops = []
+    monkeypatch.setattr(
+        async_delegation,
+        "drop_completion_delivery",
+        lambda delegation_id, _claim_id: drops.append(delegation_id) or True,
+        raising=False,
+    )
+
+    delivered = asyncio.run(
+        runner._deliver_completion_notification("completion", event)
+    )
+
+    assert delivered is None
+    adapter.handle_message.assert_not_awaited()
+    assert drops == ["deleg_stale_live_parent"]
+
+
+def test_current_async_completion_survives_preflight(monkeypatch):
+    from tools import async_delegation
+
+    event = _async_event("deleg_current_parent")
+    event["parent_session_id"] = "sess_current"
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(
+        adapter,
+        origins={event["session_key"]: _route_entry("sess_current")},
+    )
+    setattr(runner, "_session_db", _FakeAsyncSessionDB({
+        "sess_current": {"id": "sess_current", "ended_at": None},
+    }))
+    monkeypatch.setattr(
+        async_delegation,
+        "claim_completion_delivery",
+        lambda _delegation_id, _claim_id: True,
+        raising=False,
+    )
+    acknowledgements = []
+    monkeypatch.setattr(
+        async_delegation,
+        "complete_completion_delivery",
+        lambda delegation_id, _claim_id: acknowledgements.append(delegation_id) or True,
+        raising=False,
+    )
+
+    delivered = asyncio.run(
+        runner._deliver_completion_notification("completion", event)
+    )
+
+    assert delivered is True
+    adapter.handle_message.assert_awaited_once()
+    assert acknowledgements == ["deleg_current_parent"]
 
 
 def _persist_pending_completion(event):

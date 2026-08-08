@@ -14026,18 +14026,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if target_session_id == session_entry.session_id:
             return session_entry
 
+        if not follows_compression:
+            logger.warning(
+                "Async-delegation completion pinned to live session %s does not "
+                "match current route session %s; dropping stale completion instead "
+                "of switching the route.",
+                target_session_id,
+                session_entry.session_id,
+            )
+            return None
+
         prior_session_id = session_entry.session_id
-        if follows_compression:
-            switched = await self.async_session_store.advance_compression_session(
-                session_entry.session_key,
-                prior_session_id,
-                target_session_id,
-            )
-        else:
-            switched = await self.async_session_store.switch_session(
-                session_entry.session_key,
-                target_session_id,
-            )
+        switched = await self.async_session_store.advance_compression_session(
+            session_entry.session_key,
+            prior_session_id,
+            target_session_id,
+        )
         if switched is None:
             logger.warning(
                 "Async-delegation completion could not bind routing key %s to "
@@ -21893,20 +21897,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return (evt_type, producer_id, started_at)
         return None
 
-    async def _classify_completion_target(self, parent_session_id: str) -> str:
+    async def _classify_completion_target(
+        self, parent_session_id: str, session_key: str = "",
+    ) -> str:
         """Classify an async-completion delivery target before adapter acceptance.
 
         Returns one of:
 
-        - ``"deliver"`` — the spawning session is live, or ended by a
-          compression rotation with a verified live continuation. The inner
-          #55578 resolver (:meth:`_resolve_async_delegation_session`) still
-          owns the actual route retarget; this pre-flight only proves the
-          completion is deliverable so the durable ack stays honest.
-        - ``"terminal"`` — the spawning session is gone for good (unknown, or
-          ended at an explicit user boundary such as /new). Delivery can never
-          succeed; the durable row should be terminally dropped rather than
-          falsely acknowledged as delivered or replayed forever as pending.
+        - ``"deliver"`` — the spawning session is the current route generation,
+          or ended by a compression rotation whose verified live continuation is
+          still owned by the current route.
+        - ``"terminal"`` — the spawning session is gone for good, or is a stale
+          live/historical session that no longer owns the route. Delivery can
+          never succeed for the current assignment; the durable row should be
+          terminally dropped rather than falsely acknowledged or replayed.
         - ``"retry"`` — transient uncertainty (session DB unavailable, lookup
           error, or a compression rotation caught mid-flight before its
           continuation exists). The claim should be released so a later
@@ -21915,6 +21919,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_db = getattr(self, "_session_db", None)
         if session_db is None:
             return "retry"
+        current_entry = self._current_session_entry(session_key) if session_key else None
+        current_session_id = str(
+            getattr(current_entry, "session_id", "") or ""
+        ).strip()
         try:
             parent = await session_db.get_session(parent_session_id)
         except Exception:
@@ -21926,6 +21934,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if parent is None:
             return "terminal"
         if not parent.get("ended_at"):
+            if current_session_id and current_session_id != parent_session_id:
+                return "terminal"
             return "deliver"
         if parent.get("end_reason") != "compression":
             return "terminal"
@@ -21944,6 +21954,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "retry"
         if tip is None or tip.get("ended_at"):
             return "retry"
+        if current_session_id and current_session_id not in {
+            parent_session_id,
+            str(tip_session_id),
+        }:
+            try:
+                route_row = await session_db.get_session(current_session_id)
+                route_tip = (
+                    await session_db.get_compression_tip(current_session_id)
+                    if route_row is not None
+                    and route_row.get("ended_at")
+                    and route_row.get("end_reason") == "compression"
+                    else None
+                )
+            except Exception:
+                return "retry"
+            if route_tip != tip_session_id:
+                return "terminal"
         return "deliver"
 
     async def _deliver_completion_notification(
@@ -21985,7 +22012,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # would falsely acknowledge the durable row as delivered.
                 # Verify the target here, before acceptance, and give drops an
                 # honest durable disposition.
-                verdict = await self._classify_completion_target(parent_session_id)
+                verdict = await self._classify_completion_target(
+                    parent_session_id,
+                    str(evt.get("session_key") or ""),
+                )
                 if verdict == "terminal":
                     logger.warning(
                         "Async delegation %s targets permanently-gone session %s; "
