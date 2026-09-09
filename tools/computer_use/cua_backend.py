@@ -4069,18 +4069,16 @@ class CuaDriverBackend(ComputerUseBackend):
 
     # ── Internal ───────────────────────────────────────────────────
     def _maybe_attach_element_token(self, tool: str, args: Dict[str, Any]) -> None:
-        """Surface 6: when the wrapper is about to call a token-capable
-        tool with `element_index`, look up the matching `element_token`
-        from the last snapshot and attach it. cua-driver-rs's contract
-        for combined args is documented in trycua/cua#1961:
+        """Attach the last capture's opaque token to its element index.
 
-          "element_token takes precedence over element_index when both
-           supplied. Returns an explicit 'stale' error if the snapshot
-           has been superseded."
+        Current cua-driver rejects bare indices: targeting requires a token
+        or an index paired with its snapshot_id. Supplied index/window fields
+        must agree with the token; the driver owns freshness validation.
 
-        Gated on the per-tool capability claim so we don't send the
-        field to drivers that predate the surface (which would reject
-        the schema with `additionalProperties: false`).
+        MCP 2 drops the driver's custom ``capabilities`` extension, but keeps
+        the standard input schema. Accept that schema's token property as
+        support, retaining the legacy capability claim for older discovery.
+        Never synthesize tokens or substitute coordinates on a refusal.
         """
         idx = args.get("element_index")
         if not isinstance(idx, int):
@@ -4088,8 +4086,9 @@ class CuaDriverBackend(ComputerUseBackend):
         token = self._snapshot_tokens.get(idx)
         if not token:
             return
-        if not self._session.supports_capability(
-            "accessibility.element_tokens", tool=tool
+        if not (
+            self._session.supports_capability("accessibility.element_tokens", tool=tool)
+            or self._session.supports_input_property(tool, "element_token")
         ):
             return
         args["element_token"] = token
