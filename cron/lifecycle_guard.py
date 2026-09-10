@@ -910,7 +910,7 @@ def _has_binary_magic(data: bytes) -> bool:
 
 
 def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
-    """Return ``(text, unsafe)`` using bounded, regular-file-only reads.
+    """Return ``(text, unsafe)`` with bounded reads; the OS null device is empty.
 
     This is the shared choke point for every local script read the guard
     performs (the terminal walk in ``_contains_unsafe_gateway_action`` AND
@@ -944,12 +944,29 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         return None, False
     try:
         metadata = os.fstat(descriptor)
+        if stat.S_ISCHR(metadata.st_mode):
+            # Heredoc data such as Path('/dev/null') can look like a script
+            # reference. Only the canonical OS null device is empty input;
+            # verify the opened descriptor too, not merely the pathname.
+            try:
+                if resolved == Path(os.devnull).resolve(strict=True):
+                    null_metadata = os.stat(os.devnull)
+                    if (
+                        stat.S_ISCHR(null_metadata.st_mode)
+                        and metadata.st_dev == null_metadata.st_dev
+                        and metadata.st_ino == null_metadata.st_ino
+                        and metadata.st_rdev == null_metadata.st_rdev
+                    ):
+                        # Empty text avoids the missing-file remote fallback.
+                        return "", False
+            except (OSError, ValueError):
+                pass  # Unverified devices retain the fail-closed verdict.
         if not stat.S_ISREG(metadata.st_mode):
             # Directories are not scripts. Docker Desktop writes
             # ``fpath=(~/.docker/completions …)`` into ``~/.zshrc``; the
             # walk then treats that dir as a referenced script and used
             # to fail-closed, blocking ``source ~/.zshrc`` (#86753).
-            # Devices/sockets stay fail-closed.
+            # All other devices/sockets stay fail-closed.
             if stat.S_ISDIR(metadata.st_mode):
                 return None, False
             return None, True

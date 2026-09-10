@@ -2048,13 +2048,12 @@ class TestLifecycleGuardNeverRaises:
         assert text is None
         assert unsafe is False
 
-    def test_directory_and_dev_null_fail_closed_not_crash(self, tmp_path):
-        # Directories are not scripts (#86753). Devices stay fail-closed
-        # where the OS actually exposes them (POSIX /dev/null).
-        # The important contract is: verdict, not exception.
+    def test_directory_and_dev_null_are_not_scripts(self, tmp_path):
+        # Directories (#86753) and the actual OS null device (MC-LOCAL-282)
+        # have no script content. Other special files remain unchanged.
         assert self._scan(f"bash {tmp_path}") is False
         if os.name != "nt":
-            assert self._scan("bash /dev/null") is True
+            assert self._scan("bash /dev/null") is False
 
     def test_magic_prefix_binaries_skipped_without_full_read(self, tmp_path):
         """Executable magic (ELF/PE/Mach-O) short-circuits the read: the
@@ -2076,14 +2075,172 @@ class TestLifecycleGuardNeverRaises:
     def test_check_gateway_lifecycle_adversarial_script_values(self, tmp_path):
         """check_gateway_lifecycle must never raise anything but the
         documented GatewayLifecycleBlocked for junk script values."""
-        from cron.lifecycle_guard import (
-            GatewayLifecycleBlocked,
-            check_gateway_lifecycle,
-        )
+        from cron.lifecycle_guard import check_gateway_lifecycle
         binary = tmp_path / "prog"
         binary.write_bytes(b"\x7fELF" + bytes(128))
         for value in ("nul\x00byte.sh", str(binary), "/nonexistent/x.sh", str(tmp_path)):
             check_gateway_lifecycle("clean prompt", value)  # must not raise
         if os.name != "nt":
-            with pytest.raises(GatewayLifecycleBlocked):
-                check_gateway_lifecycle("clean prompt", "/dev/null")
+            check_gateway_lifecycle("clean prompt", "/dev/null")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX character-device contract")
+class TestLifecycleGuardNullDevice:
+    # Exact command from cron_01c62271b91e_20260910_163012, assistant
+    # 268173 / tool 268174. DATA ONLY: never exec/eval or import its helper.
+    BENIGN_COMMAND = """python3 -B - <<'PY'
+import sys,json
+from pathlib import Path
+sys.path.insert(0,'/Users/fgdghooprtator/Developer/openclaw-portal-build-mc-local-282-x-reporting/app/scripts')
+import blp_buzz_approval_cycle as m
+c=m.CycleConfig('TCC','MC-LOCAL-282 nonpublic receipt diagnosis','d0ae429f-7582-41a5-a97e-8e2237edb9a0','587a4752c37df7457b6ed65fd33fb92922e9470a605a4cc6fbd24cbb5f336105','e5c4819a2c0477ced635c2baac3f730167f4bd28bfb1305ceabfe8785844c69a','FGD TCC Scheduler','com.fgd.mc-local-282.tcc-buzz-scheduler','mc-local-282-tcc-scheduler','@TheChangeCurve',Path('/dev/null'),Path('/dev/null'))
+s=m.keychain_secret(c)
+assert m.own_pubkey(c,s)=='27b3d251b1205293e6a4b771d018b35636728f320cbe4747dac299bdf8ae2574'
+r=m.buzz(c,s,['users','get','--pubkey',c.wendy_public_key])
+def clean(v):
+ if isinstance(v,list): return [clean(x) for x in v]
+ if isinstance(v,dict): return {k:clean(x) for k,x in v.items() if k in ('pubkey','public_key','name','display_name','owner_pubkey','verification','owned_by_me','profile','user')}
+ return v
+print(json.dumps(clean(r)))
+print(json.dumps([{k:e.get(k) for k in ('id','pubkey','content','created_at')} for e in m.thread(c,s)[-4:]]))
+PY"""
+
+    def test_exact_benign_heredoc_is_not_lifecycle(self, tmp_path):
+        from cron import lifecycle_guard as guard
+
+        assert guard._direct_lifecycle_scan(self.BENIGN_COMMAND) is False
+        assert guard.contains_gateway_lifecycle_command_or_referenced_script(
+            self.BENIGN_COMMAND, cwd=str(tmp_path)
+        ) is False
+
+    @pytest.mark.parametrize("alias", [False, True], ids=["canonical", "symlink"])
+    def test_null_is_empty_without_read_or_remote_fallback(
+        self, tmp_path, monkeypatch, alias
+    ):
+        from pathlib import Path
+        from cron import lifecycle_guard as guard
+
+        path = Path(os.devnull)
+        if alias:
+            path = tmp_path / "null-link"
+            path.symlink_to(os.devnull)
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("null must not be read or sent to the remote reader")
+
+        monkeypatch.setattr(guard.os, "read", forbidden)
+        assert guard._read_referenced_script(path) == ("", False)
+        assert guard.contains_gateway_lifecycle_command_or_referenced_script(
+            f"bash {path}", read_remote_script=forbidden
+        ) is False
+
+    @pytest.mark.parametrize("field", ["st_dev", "st_ino", "st_rdev"])
+    def test_null_path_with_mismatched_descriptor_identity_is_unsafe(
+        self, monkeypatch, field
+    ):
+        from pathlib import Path
+        from types import SimpleNamespace
+        from cron import lifecycle_guard as guard
+
+        original_fstat = os.fstat
+
+        def mismatched(fd):
+            actual = original_fstat(fd)
+            metadata = {key: getattr(actual, key) for key in (
+                "st_mode", "st_dev", "st_ino", "st_rdev"
+            )}
+            metadata[field] += 1
+            return SimpleNamespace(**metadata)
+
+        monkeypatch.setattr(guard.os, "fstat", mismatched)
+        assert guard._read_referenced_script(Path(os.devnull)) == (None, True)
+
+    @pytest.mark.parametrize("unavailable", [False, True], ids=["not-character", "stat-error"])
+    def test_unverified_null_identity_stays_unsafe(self, monkeypatch, unavailable):
+        from pathlib import Path
+        from types import SimpleNamespace
+        import stat
+        from cron import lifecycle_guard as guard
+
+        original_stat = os.stat
+
+        def unverified(path, *args, **kwargs):
+            if path == os.devnull:
+                if unavailable:
+                    raise OSError("null identity unavailable")
+                return SimpleNamespace(st_mode=stat.S_IFREG)
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(guard.os, "stat", unverified)
+        assert guard._read_referenced_script(Path(os.devnull)) == (None, True)
+
+    def test_null_path_opened_as_regular_script_is_still_scanned(
+        self, tmp_path, monkeypatch
+    ):
+        from pathlib import Path
+        from cron import lifecycle_guard as guard
+
+        script = tmp_path / "replacement"
+        script.write_text("hermes gateway restart\n")
+        original_open = os.open
+
+        def replaced_open(path, flags):
+            return original_open(script if Path(path) == Path(os.devnull) else path, flags)
+
+        monkeypatch.setattr(guard.os, "open", replaced_open)
+        assert guard._read_referenced_script(Path(os.devnull)) == (
+            "hermes gateway restart\n", False
+        )
+        assert guard.contains_gateway_lifecycle_command_or_referenced_script(
+            f"bash {os.devnull}"
+        ) is True
+
+    def test_regular_file_named_null_and_symlink_are_still_scanned(self, tmp_path):
+        from cron import lifecycle_guard as guard
+
+        script = tmp_path / "dev" / "null"
+        script.parent.mkdir()
+        script.write_text("hermes gateway restart\n")
+        alias = tmp_path / "null-link"
+        alias.symlink_to(script)
+        for path in (script, alias):
+            assert guard.contains_gateway_lifecycle_command_or_referenced_script(
+                f"bash {path}"
+            ) is True
+
+    def test_fifo_stays_unsafe(self, tmp_path):
+        from cron import lifecycle_guard as guard
+
+        fifo = tmp_path / "null"
+        os.mkfifo(fifo)
+        assert guard._read_referenced_script(fifo) == (None, True)
+
+    def test_non_null_character_device_stays_unsafe(self):
+        from pathlib import Path
+        from cron import lifecycle_guard as guard
+
+        assert guard._read_referenced_script(Path("/dev/zero")) == (None, True)
+
+    def test_socket_descriptor_stays_unsafe(self, monkeypatch):
+        from pathlib import Path
+        import socket
+        from cron import lifecycle_guard as guard
+
+        # Opening a filesystem Unix socket normally fails before fstat.
+        # Supply a real socket fd to exercise the special-file type gate.
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            monkeypatch.setattr(guard.os, "open", lambda path, flags: os.dup(sock.fileno()))
+            assert guard._read_referenced_script(Path(os.devnull)) == (None, True)
+
+    @pytest.mark.parametrize("command", [
+        "hermes gateway restart",
+        "bash -lc 'hermes gateway stop'",
+        "env HERMES_PROFILE=sibling hermes gateway uninstall",
+        "python3 -c 'import os; os.system(\"hermes gateway restart\")'",
+    ])
+    def test_null_reference_does_not_hide_lifecycle(self, command):
+        from cron import lifecycle_guard as guard
+
+        assert guard.contains_gateway_lifecycle_command_or_referenced_script(
+            f"bash {os.devnull}; {command}"
+        ) is True
