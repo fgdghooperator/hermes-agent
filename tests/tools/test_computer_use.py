@@ -56,6 +56,88 @@ class TestRegistration:
         assert cua_backend.cua_driver_binary_available() is True
 
 
+
+
+class TestConfigPreauthorization:
+    def test_bounded_manifest_preauthorizes_typed_browser_mutations(self, monkeypatch, tmp_path):
+        from tools.computer_use import cua_backend as cb
+        from tools.computer_use import tool as cu_tool
+
+        manifest = tmp_path / "cua-capabilities.yaml"
+        manifest.write_text("version: 3\n", encoding="utf-8")
+        monkeypatch.setattr(
+            cb,
+            "_computer_use_cfg",
+            lambda: {
+                "permission_mode": "bounded",
+                "capability_manifest": str(manifest),
+            },
+        )
+
+        for action in ("cua_browser_prepare", "cua_browser_navigate", "cua_browser_click", "cua_browser_type"):
+            assert cu_tool._config_preauthorized(action, {}) is True
+
+    def test_bounded_manifest_does_not_preauthorize_native_input(self, monkeypatch, tmp_path):
+        from tools.computer_use import cua_backend as cb
+        from tools.computer_use import tool as cu_tool
+
+        manifest = tmp_path / "cua-capabilities.yaml"
+        manifest.write_text("version: 3\n", encoding="utf-8")
+        monkeypatch.setattr(
+            cb,
+            "_computer_use_cfg",
+            lambda: {
+                "permission_mode": "bounded",
+                "capability_manifest": str(manifest),
+            },
+        )
+
+        for action in ("click", "type", "key", "set_value"):
+            assert cu_tool._config_preauthorized(action, {}) is False
+
+    def test_bounded_manifest_preauthorization_fails_closed(self, monkeypatch, tmp_path):
+        from tools.computer_use import cua_backend as cb
+        from tools.computer_use import tool as cu_tool
+
+        monkeypatch.setattr(
+            cb,
+            "_computer_use_cfg",
+            lambda: {
+                "permission_mode": "bounded",
+                "capability_manifest": str(tmp_path / "missing.yaml"),
+            },
+        )
+        assert cu_tool._config_preauthorized("cua_browser_type", {}) is False
+
+        manifest = tmp_path / "legacy.yaml"
+        manifest.write_text("version: 2\n", encoding="utf-8")
+        monkeypatch.setattr(
+            cb,
+            "_computer_use_cfg",
+            lambda: {
+                "permission_mode": "bounded",
+                "capability_manifest": str(manifest),
+            },
+        )
+        assert cu_tool._config_preauthorized("cua_browser_type", {}) is False
+
+    def test_standard_mode_manifest_does_not_preauthorize_browser_type(self, monkeypatch, tmp_path):
+        from tools.computer_use import cua_backend as cb
+        from tools.computer_use import tool as cu_tool
+
+        manifest = tmp_path / "cua-capabilities.yaml"
+        manifest.write_text("version: 3\n", encoding="utf-8")
+        monkeypatch.setattr(
+            cb,
+            "_computer_use_cfg",
+            lambda: {
+                "permission_mode": "standard",
+                "capability_manifest": str(manifest),
+            },
+        )
+
+        assert cu_tool._config_preauthorized("cua_browser_type", {}) is False
+
 # ---------------------------------------------------------------------------
 # Dispatch & action routing
 # ---------------------------------------------------------------------------

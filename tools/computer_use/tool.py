@@ -177,6 +177,74 @@ def _install_backend(sid: str, backend: ComputerUseBackend, permission_mode: str
     _backend = backend if sid == "" else _backend
     return backend
 
+_BOUNDED_TYPED_BROWSER_PREAUTHORIZED_ACTIONS = frozenset({
+    "cua_browser_prepare",
+    "cua_browser_navigate",
+    "cua_browser_click",
+    "cua_browser_type",
+})
+
+
+def _bounded_manifest_preauthorized(action: str) -> bool:
+    """True when bounded mode's reviewed manifest owns typed-browser auth.
+
+    Cua's bounded runtime is deny-by-default and validates the manifest at the
+    backend boundary. Hermes may skip its own interactive prompt only for the
+    narrow typed-browser surface that still crosses Cua's manifest. Native
+    desktop input remains prompted because browser origins cannot constrain it.
+    """
+    if action not in _BOUNDED_TYPED_BROWSER_PREAUTHORIZED_ACTIONS:
+        return False
+    try:
+        from tools.computer_use.cua_backend import (
+            _computer_use_cfg,
+            _cua_configured_permission_mode,
+            _manifest_is_mode_independent,
+        )
+
+        if _cua_configured_permission_mode() != "bounded":
+            return False
+        manifest = _computer_use_cfg().get("capability_manifest")
+        if not isinstance(manifest, str) or not manifest.strip():
+            return False
+        manifest_path = os.path.abspath(os.path.expanduser(manifest.strip()))
+        if not os.path.isfile(manifest_path):
+            return False
+        return _manifest_is_mode_independent(manifest_path)
+    except Exception:
+        return False
+
+
+def _config_preauthorized(action: str, args: Dict[str, Any]) -> bool:
+    """True when config already carries the authorization for this action.
+
+    ``computer_use.grant_existing_profile`` is a durable, file-backed opt-in
+    that the model can never set. When it is on, an extra runtime prompt for
+    the existing-profile prepare asks the user to re-authorize what they
+    already authorized — and it makes the documented opt-in unusable on any
+    non-interactive run, where the prompt has nobody to answer it and the call
+    dies on approval timeout instead of attaching.
+
+    ``computer_use.permission_mode: bounded`` with a valid reviewed version-3
+    capability manifest is also a config-backed authorization boundary, but
+    only for the typed-browser actions that still cross Cua's manifest checks.
+    Generic native desktop input is not preauthorized because browser origins
+    cannot constrain it.
+    """
+    if _bounded_manifest_preauthorized(action):
+        return True
+    if action != "cua_browser_prepare":
+        return False
+    if args.get("profile_mode") != "existing_profile":
+        return False
+    try:
+        from tools.computer_use.cua_backend import _cua_grant_existing_profile
+
+        return _cua_grant_existing_profile() is True
+    except Exception:
+        return False
+
+
 def _detach_locked(sid: str) -> Tuple[Optional[ComputerUseBackend], Optional[threading.RLock]]:
     """Remove one session's cache entries, plus the ``_backend`` injection hook when it aliases the empty session
     (older callers/tests may populate only the hook). Caller holds ``_backend_lock``."""
