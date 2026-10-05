@@ -277,6 +277,44 @@ def _cua_permission_mode(session_id: str) -> str:
         return "standard"
 
 
+_BOUNDED_TYPED_BROWSER_PREAUTHORIZED_ACTIONS = frozenset({
+    "cua_browser_prepare",
+    "cua_browser_navigate",
+    "cua_browser_click",
+    "cua_browser_type",
+})
+
+
+def _bounded_manifest_preauthorized(action: str) -> bool:
+    """True when bounded mode's reviewed manifest owns typed-browser auth.
+
+    Cua's bounded runtime is deny-by-default and validates the manifest at the
+    backend boundary.  Hermes may skip its own interactive prompt only for the
+    narrow typed-browser surface that still crosses that Cua manifest.  Native
+    desktop input remains prompted because browser origins cannot constrain it.
+    """
+    if action not in _BOUNDED_TYPED_BROWSER_PREAUTHORIZED_ACTIONS:
+        return False
+    try:
+        from tools.computer_use.cua_backend import (
+            _cua_capability_manifest,
+            _cua_configured_permission_mode,
+            _manifest_is_mode_independent,
+        )
+
+        if _cua_configured_permission_mode() != "bounded":
+            return False
+        manifest = _cua_capability_manifest()
+        if not manifest:
+            return False
+        manifest_path = os.path.abspath(os.path.expanduser(manifest))
+        if not os.path.isfile(manifest_path):
+            return False
+        return _manifest_is_mode_independent(manifest_path)
+    except Exception:
+        return False
+
+
 def _config_preauthorized(action: str, args: Dict[str, Any]) -> bool:
     """True when config already carries the authorization for this action.
 
@@ -287,10 +325,14 @@ def _config_preauthorized(action: str, args: Dict[str, Any]) -> bool:
     non-interactive run, where the prompt has nobody to answer it and the
     call dies on approval timeout instead of attaching.
 
-    Scope is deliberately narrow: only the existing-profile prepare, only
-    when the grant is present. Isolated-profile launches still prompt, and
-    any resolution failure falls closed to prompting.
+    ``computer_use.permission_mode: bounded`` with a valid reviewed version-3
+    capability manifest is also a config-backed authorization boundary, but
+    only for the typed-browser actions that still cross Cua's manifest checks.
+    Generic native desktop input is not preauthorized because browser origins
+    cannot constrain it.
     """
+    if _bounded_manifest_preauthorized(action):
+        return True
     if action != "cua_browser_prepare":
         return False
     if args.get("profile_mode") != "existing_profile":

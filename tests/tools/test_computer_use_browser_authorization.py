@@ -216,6 +216,137 @@ def test_preauthorization_fails_closed_on_config_error(monkeypatch):
     ) is False
 
 
+@pytest.mark.parametrize(
+    "action",
+    ["cua_browser_navigate", "cua_browser_click", "cua_browser_type"],
+)
+def test_bounded_manifest_preauthorizes_typed_browser_mutations(
+    monkeypatch, tmp_path, action
+):
+    manifest = tmp_path / "cua-capabilities.yaml"
+    manifest.write_text("version: 3\n", encoding="utf-8")
+    monkeypatch.setattr(
+        cb,
+        "_computer_use_cfg",
+        lambda: {
+            "permission_mode": "bounded",
+            "capability_manifest": str(manifest),
+        },
+    )
+
+    assert _preauth()(action, {}) is True
+
+
+def test_bounded_without_manifest_does_not_preauthorize_browser_type(monkeypatch):
+    monkeypatch.setattr(
+        cb,
+        "_computer_use_cfg",
+        lambda: {"permission_mode": "bounded", "capability_manifest": ""},
+    )
+
+    assert _preauth()("cua_browser_type", {}) is False
+
+
+def test_bounded_missing_manifest_does_not_preauthorize_browser_type(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        cb,
+        "_computer_use_cfg",
+        lambda: {
+            "permission_mode": "bounded",
+            "capability_manifest": str(tmp_path / "missing.yaml"),
+        },
+    )
+
+    assert _preauth()("cua_browser_type", {}) is False
+
+
+def test_bounded_invalid_manifest_does_not_preauthorize_browser_type(
+    monkeypatch, tmp_path
+):
+    manifest = tmp_path / "invalid.yaml"
+    manifest.write_text("version: [\n", encoding="utf-8")
+    monkeypatch.setattr(
+        cb,
+        "_computer_use_cfg",
+        lambda: {
+            "permission_mode": "bounded",
+            "capability_manifest": str(manifest),
+        },
+    )
+
+    assert _preauth()("cua_browser_type", {}) is False
+
+
+@pytest.mark.parametrize("action", ["click", "type", "key", "set_value"])
+def test_bounded_manifest_does_not_preauthorize_native_desktop_input(
+    monkeypatch, tmp_path, action
+):
+    manifest = tmp_path / "cua-capabilities.yaml"
+    manifest.write_text("version: 3\n", encoding="utf-8")
+    monkeypatch.setattr(
+        cb,
+        "_computer_use_cfg",
+        lambda: {
+            "permission_mode": "bounded",
+            "capability_manifest": str(manifest),
+        },
+    )
+
+    assert _preauth()(action, {}) is False
+
+
+def test_standard_mode_browser_type_still_requires_interactive_approval(
+    monkeypatch, tmp_path
+):
+    manifest = tmp_path / "cua-capabilities.yaml"
+    manifest.write_text("version: 3\n", encoding="utf-8")
+    monkeypatch.setattr(
+        cb,
+        "_computer_use_cfg",
+        lambda: {
+            "permission_mode": "standard",
+            "capability_manifest": str(manifest),
+        },
+    )
+
+    assert _preauth()("cua_browser_type", {}) is False
+
+
+def test_bounded_manifest_preauth_still_lets_backend_denial_surface(monkeypatch, tmp_path):
+    import json
+    from unittest.mock import Mock
+
+    from tools.computer_use import tool as cu_tool
+
+    manifest = tmp_path / "cua-capabilities.yaml"
+    manifest.write_text("version: 3\n", encoding="utf-8")
+    monkeypatch.setattr(
+        cb,
+        "_computer_use_cfg",
+        lambda: {
+            "permission_mode": "bounded",
+            "capability_manifest": str(manifest),
+        },
+    )
+    backend = Mock()
+    backend.typed_browser_action.return_value = {
+        "status": "error",
+        "code": "bounded_resource_outside_manifest",
+    }
+    monkeypatch.setattr(cu_tool, "_get_backend", lambda session_id="": backend)
+    cu_tool.set_approval_callback(lambda *_: "deny")
+
+    raw = cu_tool.handle_computer_use(
+        {"action": "cua_browser_type", "tab_id": "tab-a", "ref": "field-a", "text": "safe"},
+        session_id="bounded-test",
+    )
+
+    assert json.loads(raw)["code"] == "bounded_resource_outside_manifest"
+    backend.typed_browser_action.assert_called_once()
+
+
 def test_dispatch_does_not_forward_removed_approval_token():
     from unittest.mock import Mock
 
